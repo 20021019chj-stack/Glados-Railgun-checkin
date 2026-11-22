@@ -52,10 +52,9 @@ jobs:
       env:
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
       run: |
-        printf '%s' "$GLADOS_COOKIES" > /tmp/cookies.json
-        wc -c /tmp/cookies.json
+        printf '%s' "$GLADOS_COOKIES" > /tmp/cookies.txt
         cat > /tmp/bc.py <<'PY_EOF'
-        import base64, json, os, sys, time
+        import json, sys, time
         from playwright.sync_api import sync_playwright
 
         SUFFIX = "glados-observe-v1"
@@ -81,6 +80,23 @@ jobs:
         }
         """
 
+        def load_accounts(raw):
+            text = raw.lstrip("\ufeff").strip()
+            accs = []
+            if text.startswith(("[", "{")):
+                data = json.loads(text)
+                if isinstance(data, dict):
+                    data = [data]
+                for a in data:
+                    if isinstance(a, dict) and a.get("cookie"):
+                        accs.append(a)
+            else:
+                for seg in text.split("&"):
+                    seg = seg.strip()
+                    if seg:
+                        accs.append({"cookie": seg})
+            return accs
+
         def ck(raw, dom):
             out = []
             for p in (raw or "").split(";"):
@@ -91,18 +107,15 @@ jobs:
             return out
 
         def main():
-            raw = open("/tmp/cookies.json", encoding="utf-8").read().strip()
-            print("[debug] bytes=%d head=%s" % (len(raw), base64.b64encode(raw[:48].encode()).decode()), flush=True)
-            i = raw.find("[")
-            if i > 0:
-                raw = raw[i:]
-            accs = [a for a in json.loads(raw) if a.get("cookie")]
+            raw = open("/tmp/cookies.txt", encoding="utf-8").read()
+            accs = load_accounts(raw)
             print("[debug] accounts=%d" % len(accs), flush=True)
             ok = 0
             with sync_playwright() as pw:
                 br = pw.chromium.launch(headless=False, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
-                for a in accs:
+                for idx, a in enumerate(accs, 1):
                     dom = (a.get("origin") or "glados.cloud").strip()
+                    label = a.get("name") or ("账号%d" % idx)
                     ctx = br.new_context(user_agent=a.get("user-agent") or UA, locale="zh-CN", timezone_id="Asia/Shanghai")
                     ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
                     try:
@@ -112,11 +125,11 @@ jobs:
                         time.sleep(10)
                         r = pg.evaluate(JS, [dom, SUFFIX])
                         data = r.get("data") or {}
-                        print(f"[{dom}] http={r.get('httpStatus')} resp={json.dumps(data, ensure_ascii=False)[:300]}", flush=True)
+                        print(f"[{label}@{dom}] http={r.get('httpStatus')} resp={json.dumps(data, ensure_ascii=False)[:300]}", flush=True)
                         if data.get("code") in (0, 1):
                             ok += 1
                     except Exception as e:
-                        print(f"[{dom}] ERROR {e}", flush=True)
+                        print(f"[{label}@{dom}] ERROR {e}", flush=True)
                     finally:
                         ctx.close()
                 br.close()
