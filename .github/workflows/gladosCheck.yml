@@ -52,11 +52,10 @@ jobs:
       env:
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
       run: |
-        echo "COOKIE_LEN=${#GLADOS_COOKIES}"
         printf '%s' "$GLADOS_COOKIES" > /tmp/cookies.json
         wc -c /tmp/cookies.json
         cat > /tmp/bc.py <<'PY_EOF'
-        import json, os, sys, time
+        import base64, json, os, sys, time
         from playwright.sync_api import sync_playwright
 
         SUFFIX = "glados-observe-v1"
@@ -93,7 +92,10 @@ jobs:
 
         def main():
             raw = open("/tmp/cookies.json", encoding="utf-8").read().strip()
-            print("[debug] cookies bytes=%d" % len(raw), flush=True)
+            print("[debug] bytes=%d head=%s" % (len(raw), base64.b64encode(raw[:48].encode()).decode()), flush=True)
+            i = raw.find("[")
+            if i > 0:
+                raw = raw[i:]
             accs = [a for a in json.loads(raw) if a.get("cookie")]
             print("[debug] accounts=%d" % len(accs), flush=True)
             ok = 0
