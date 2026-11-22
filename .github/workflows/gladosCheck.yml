@@ -152,7 +152,7 @@ jobs:
     # 浏览器方案失败时用原 HTTP 脚本兜底（并保留日志便于对比诊断）
     - name: Fallback checkin (HTTP, only after browser failure)
       if: failure()
-run: python checkin.py
+            run: python checkin.py
       env:
         PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
         SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
