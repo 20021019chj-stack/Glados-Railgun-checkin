@@ -8,11 +8,9 @@ on:
       - 'README.md'
       - 'imgs/**'
   schedule:
-    # 每天北京时间 09:18 签到（= UTC 01:18）。
-    # 直接写 UTC，不依赖 schedule.timezone 字段，避免时区解释差异导致跑偏。
+    # 每天北京时间 09:18 签到（= UTC 01:18），不依赖 timezone 字段
     - cron: '18 1 * * *'
 
-# 定时与手动触发可能重叠：同一时间只保留一个运行，避免重复签到与重复推送
 concurrency:
   group: glados-checkin
   cancel-in-progress: false
@@ -21,17 +19,13 @@ jobs:
   build:
     name: glados/railgun checkin
     runs-on: ubuntu-latest
-
     timeout-minutes: 20
-
     permissions:
       contents: write
       actions: write
-
     strategy:
       matrix:
         python-version: [3.13]
-
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -39,28 +33,31 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v6
 
-    - name: Set up Python ${{ matrix.python-version }}
+    - name: Set up Python
       uses: actions/setup-python@v6
       with:
-        python-version: ${{ matrix.python-version }}
+        python-version: '3.13'
 
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    # GLaDOS 签到已启用 Cloudflare Turnstile：纯 HTTP 请求会被判定
-    # code=5 Cloudflare verification failed，必须在真实浏览器里完成签到。
-    - name: Install browser (Playwright Chromium)
+    # GLaDOS 签到已启用 Cloudflare Turnstile，纯 HTTP 请求会返回 code=5，
+    # 因此改用真实浏览器（Playwright + xvfb）完成签到。
+    - name: Install browser
       run: |
         pip install playwright
         python -m playwright install --with-deps chromium
         sudo apt-get update -qq
         sudo apt-get install -y -qq xvfb
 
-    - name: Running checkin (real browser)
+    - name: Running checkin in real browser
+      env:
+        GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
+        GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
       run: |
-        cat > /tmp/browser_checkin.py <<'PY_EOF'
+        cat > /tmp/bc.py <<'PY_EOF'
         import json, os, sys, time
         from playwright.sync_api import sync_playwright
 
@@ -70,95 +67,62 @@ jobs:
 
         JS = """
         async ([domain, suffix]) => {
-          const readJson = async (r) => { try { return await r.json(); } catch (e) { return null; } };
+          const rj = async (r) => { try { return await r.json(); } catch (e) { return null; } };
           let ch = null;
           try {
-            const cr = await fetch('/api/user/checkin/challenge', {headers: {'accept': 'application/json'}, credentials: 'include'});
-            ch = await readJson(cr);
-          } catch (e) { ch = {error: String(e)}; }
+            ch = await rj(await fetch('/api/user/checkin/challenge', {headers: {'accept': 'application/json'}, credentials: 'include'}));
+          } catch (e) { ch = null; }
           const body = {token: domain};
           if (ch && ch.code === 0 && ch.nonce) {
-            const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ch.nonce + '.' + suffix));
+            const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ch.nonce + '.' + suffix));
             body.nonce = ch.nonce;
-            body.proof = Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+            body.proof = Array.from(new Uint8Array(d)).map((b) => b.toString(16).padStart(2, '0')).join('');
             await new Promise((r) => setTimeout(r, 2500));
           }
-          const res = await fetch('/api/user/checkin', {
-            method: 'POST',
-            headers: {'accept': 'application/json', 'content-type': 'application/json'},
-            credentials: 'include',
-            body: JSON.stringify(body),
-          });
-          return {httpStatus: res.status, challenge: ch, data: await readJson(res)};
+          const res = await fetch('/api/user/checkin', {method: 'POST', headers: {'accept': 'application/json', 'content-type': 'application/json'}, credentials: 'include', body: JSON.stringify(body)});
+          return {httpStatus: res.status, challenge: ch, data: await rj(res)};
         }
         """
 
-        def cookies_of(raw, domain):
+        def ck(raw, dom):
             out = []
-            for part in (raw or "").split(";"):
-                part = part.strip()
-                if "=" not in part:
-                    continue
-                k, v = part.split("=", 1)
-                out.append({"name": k.strip(), "value": v.strip(), "domain": domain, "path": "/"})
+            for p in (raw or "").split(";"):
+                p = p.strip()
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    out.append({"name": k.strip(), "value": v.strip(), "domain": dom, "path": "/"})
             return out
 
         def main():
-            accounts = [a for a in json.loads(os.environ["GLADOS_COOKIES"]) if a.get("cookie")]
-            print(f"[browser] 账号数 {len(accounts)}", flush=True)
+            accs = [a for a in json.loads(os.environ["GLADOS_COOKIES"]) if a.get("cookie")]
             ok = 0
-            with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=False,
-                    args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-                )
-                for i, acc in enumerate(accounts, 1):
-                    domain = (acc.get("origin") or "glados.cloud").strip()
-                    label = acc.get("name") or f"账号{i}"
-                    ctx = browser.new_context(user_agent=acc.get("user-agent") or UA,
-                                              locale="zh-CN", timezone_id="Asia/Shanghai")
+            with sync_playwright() as pw:
+                br = pw.chromium.launch(headless=False, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+                for a in accs:
+                    dom = (a.get("origin") or "glados.cloud").strip()
+                    ctx = br.new_context(user_agent=a.get("user-agent") or UA, locale="zh-CN", timezone_id="Asia/Shanghai")
                     ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
                     try:
-                        ctx.add_cookies(cookies_of(acc["cookie"], domain))
-                        page = ctx.new_page()
-                        page.goto(f"https://{domain}/console", wait_until="domcontentloaded", timeout=60000)
+                        ctx.add_cookies(ck(a["cookie"], dom))
+                        pg = ctx.new_page()
+                        pg.goto(f"https://{dom}/console", wait_until="domcontentloaded", timeout=60000)
                         time.sleep(10)
-                        res = page.evaluate(JS, [domain, SUFFIX])
-                        data = res.get("data") or {}
-                        print(f"[{label}@{domain}] http={res.get('httpStatus')} resp={json.dumps(data, ensure_ascii=False)[:300]}", flush=True)
+                        r = pg.evaluate(JS, [dom, SUFFIX])
+                        data = r.get("data") or {}
+                        print(f"[{dom}] http={r.get('httpStatus')} resp={json.dumps(data, ensure_ascii=False)[:300]}", flush=True)
                         if data.get("code") in (0, 1):
                             ok += 1
-                            print(f"[{label}@{domain}] OK code={data.get('code')} msg={data.get('message')}", flush=True)
-                        else:
-                            print(f"[{label}@{domain}] FAIL challenge={json.dumps(res.get('challenge'), ensure_ascii=False)[:200]}", flush=True)
-                    except Exception as exc:
-                        print(f"[{label}@{domain}] ERROR {exc}", flush=True)
+                    except Exception as e:
+                        print(f"[{dom}] ERROR {e}", flush=True)
                     finally:
                         ctx.close()
-                browser.close()
-            print(f"[browser] 成功/重复 {ok}/{len(accounts)}", flush=True)
+                br.close()
+            print(f"[browser] ok {ok}/{len(accs)}", flush=True)
             return 0 if ok else 2
 
         sys.exit(main())
         PY_EOF
-        xvfb-run -a python /tmp/browser_checkin.py
-      env:
-        PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
-        SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
-        GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
-        GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
-        GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
-
-    # 浏览器方案失败时用原 HTTP 脚本兜底（并保留日志便于对比诊断）
-    - name: Fallback checkin (HTTP, only after browser failure)
-      if: failure()
-            run: python checkin.py
-      env:
-        PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
-        SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
-        GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
-        GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
-        GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+        xvfb-run -a python /tmp/bc.py
 
     - name: Keep alive
       if: ${{ !cancelled() }}
