@@ -1,4 +1,4 @@
-name: GLaDOS Check-in
+    - cron: '18 1,2,3,4,5 * * *'name: GLaDOS Check-in
 
 on:
   workflow_dispatch:
